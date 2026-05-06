@@ -278,6 +278,13 @@ with st.sidebar:
         type=["xlsx", "xls"],
         help="Upload Excel file containing Error / Cancelled trade data.",
     )
+    uploaded_otr = st.file_uploader(
+        "4. OTR / Clearing Obligation File (Optional)",
+        type=["csv"],
+        help="Upload the NCL (NSE Clearing) or ICCL (BSE Clearing) "
+             "Obligation file (CSV). The tool will reconcile date-wise "
+             "Cumulative Buy / Sell volumes (column X / Y) against the Cash RO.",
+    )
 
     st.markdown("---")
     st.markdown("### Optional Files")
@@ -321,16 +328,18 @@ if uploaded_cash is None and uploaded_fo is None:
     1. Upload the **Cash RO File** (all sheets treated as Cash trades)
     2. Upload the **F&O RO File** (all sheets treated as F&O trades)
     3. Upload the **Error Trade File** (all sheets treated as error/cancelled trades)
-    4. Optionally upload the **Brokerage Summary** and **Stamp Duty Bank Payment** files
-    5. Adjust thresholds if needed
-    6. Review results in tabs and download the Excel report
+    4. Optionally upload the **OTR / Clearing Obligation File** (CSV from NCL/ICCL)
+       to reconcile daily Buy/Sell volumes against the Cash RO
+    5. Optionally upload the **Brokerage Summary** and **Stamp Duty Bank Payment** files
+    6. Adjust thresholds if needed
+    7. Review results in tabs and download the Excel report
 
     **Supported analytics:**
-    Summary Dashboard, Turnover Reconciliation, Client Concentration,
-    Scrip Analysis, Brokerage Rate Analytics, Error Trade Analysis,
-    GST Analytics, STT Verification, SEBI Fees, Stamp Duty Analysis,
-    Adjustment Analysis, Buy/Sell Analysis, Temporal Analysis,
-    Client × Product Analysis, Transaction-Level Analysis
+    Summary Dashboard, Turnover Reconciliation, OTR Reconciliation,
+    Client Concentration, Scrip Analysis, Brokerage Rate Analytics,
+    Error Trade Analysis, GST Analytics, STT Verification, SEBI Fees,
+    Stamp Duty Analysis, Adjustment Analysis, Buy/Sell Analysis,
+    Temporal Analysis, Client × Product Analysis, Transaction-Level Analysis
     """)
     st.stop()
 
@@ -367,6 +376,22 @@ def load_first_sheet(file_bytes):
     xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
     df = pd.read_excel(xls, sheet_name=xls.sheet_names[0], engine="openpyxl")
     xls.close()
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_otr_csv(file_bytes):
+    """Load the OTR / Clearing Corporation Obligation CSV file.
+    Expected schema: Sgmt, Src, ClrMmbId, ..., RptgDt, ..., DalyBuyTradgVol,
+    DalySellTradgVol, ..., CmltvBuyVol (col X), CmltvSellVol (col Y), ..."""
+    df = pd.read_csv(io.BytesIO(file_bytes), low_memory=False)
+    if "RptgDt" in df.columns:
+        df["RptgDt"] = pd.to_datetime(df["RptgDt"], errors="coerce")
+    for c in ("CmltvBuyVol", "CmltvSellVol",
+              "DalyBuyTradgVol", "DalySellTradgVol",
+              "CmltvBuyAmt", "CmltvSellAmt"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     return df
 
 
@@ -410,6 +435,20 @@ if uploaded_error is not None:
         sheet_counts["Error"] = err_sheets
         st.success(f"Error Trades: {len(df_errors):,} rows across {err_sheets} sheet(s) "
                    f"from {uploaded_error.name}")
+
+prog.progress(70, text="Loading OTR file...")
+
+# OTR / Clearing Obligation file
+df_otr = pd.DataFrame()
+if uploaded_otr is not None:
+    otr_bytes = uploaded_otr.read()
+    df_otr = load_otr_csv(otr_bytes)
+    if not df_otr.empty:
+        otr_src = ""
+        if "Src" in df_otr.columns and len(df_otr):
+            otr_src = str(df_otr["Src"].dropna().iloc[0]).strip().upper() if df_otr["Src"].notna().any() else ""
+        st.success(f"OTR File: {len(df_otr):,} rows from {uploaded_otr.name} "
+                   f"(Source: {otr_src or 'unknown'})")
 
 prog.progress(80, text="Loading optional files...")
 
@@ -513,6 +552,81 @@ def prepare_trades(df):
         df[COL_PRODUCT_DESC] = df[COL_PRODUCT_DESC].astype(str).str.strip().str.upper()
 
     return df
+
+
+def build_otr_recon(df_otr, df_trades):
+    """Build date-wise OTR vs RO Buy/Sell volume reconciliation.
+
+    OTR source 'NCL' is compared to NSE Cash trades; 'ICCL' to BSE Cash;
+    anything else is compared to all Cash segment trades.
+
+    Returns: (recon_df, ro_label, otr_src) where recon_df is empty if either
+    side cannot be aggregated.
+    """
+    if df_otr is None or df_otr.empty:
+        return pd.DataFrame(), "", ""
+
+    otr_src = ""
+    if "Src" in df_otr.columns and df_otr["Src"].notna().any():
+        otr_src = str(df_otr["Src"].dropna().iloc[0]).strip().upper()
+
+    if otr_src == "NCL":
+        ro_label = "NSE Cash"
+        ro_subset = df_trades[df_trades.get("Segment", "") == "NSE Cash"]
+    elif otr_src == "ICCL":
+        ro_label = "BSE Cash"
+        ro_subset = df_trades[df_trades.get("Segment", "") == "BSE Cash"]
+    else:
+        ro_label = "All Cash"
+        ro_subset = df_trades[df_trades.get("Segment", "").isin(["NSE Cash", "BSE Cash"])]
+
+    if "RptgDt" not in df_otr.columns or "CmltvBuyVol" not in df_otr.columns:
+        return pd.DataFrame(), ro_label, otr_src
+
+    otr_clean = df_otr.dropna(subset=["RptgDt"])
+    otr_grp = (otr_clean.assign(_d=otr_clean["RptgDt"].dt.date)
+                       .groupby("_d", as_index=False)
+                       .agg(OTR_Buy_Vol=("CmltvBuyVol", "sum"),
+                            OTR_Sell_Vol=("CmltvSellVol", "sum"))
+                       .rename(columns={"_d": "Date"}))
+
+    if (COL_TXN_DATE not in ro_subset.columns
+            or COL_QTY not in ro_subset.columns
+            or COL_BUY_SELL not in ro_subset.columns
+            or ro_subset.empty):
+        ro_grp = pd.DataFrame(columns=["Date", "RO_Buy_Vol", "RO_Sell_Vol"])
+    else:
+        ro = ro_subset.copy()
+        ro["_side"] = ro[COL_BUY_SELL].astype(str).str.strip().str.upper()
+        ro["_d"] = pd.to_datetime(ro[COL_TXN_DATE], errors="coerce").dt.date
+        ro = ro.dropna(subset=["_d"])
+        buy = (ro[ro["_side"].str.startswith("B")]
+               .groupby("_d")[COL_QTY].sum().rename("RO_Buy_Vol"))
+        sell = (ro[ro["_side"].str.startswith("S")]
+                .groupby("_d")[COL_QTY].sum().rename("RO_Sell_Vol"))
+        ro_grp = (pd.concat([buy, sell], axis=1)
+                    .fillna(0).reset_index().rename(columns={"_d": "Date"}))
+
+    recon = pd.merge(ro_grp, otr_grp, on="Date", how="outer").fillna(0)
+    recon = recon.sort_values("Date").reset_index(drop=True)
+    recon["Buy Diff (RO - OTR)"] = recon["RO_Buy_Vol"] - recon["OTR_Buy_Vol"]
+    recon["Sell Diff (RO - OTR)"] = recon["RO_Sell_Vol"] - recon["OTR_Sell_Vol"]
+    recon["Buy Match"] = np.where(recon["Buy Diff (RO - OTR)"].abs() < 1, "Yes", "No")
+    recon["Sell Match"] = np.where(recon["Sell Diff (RO - OTR)"].abs() < 1, "Yes", "No")
+    recon["Date"] = recon["Date"].astype(str)
+
+    recon = recon.rename(columns={
+        "RO_Buy_Vol": f"RO Buy Vol ({ro_label})",
+        "OTR_Buy_Vol": "OTR Buy Vol (CmltvBuyVol)",
+        "RO_Sell_Vol": f"RO Sell Vol ({ro_label})",
+        "OTR_Sell_Vol": "OTR Sell Vol (CmltvSellVol)",
+    })
+    recon = recon[["Date",
+                   f"RO Buy Vol ({ro_label})", "OTR Buy Vol (CmltvBuyVol)",
+                   "Buy Diff (RO - OTR)", "Buy Match",
+                   f"RO Sell Vol ({ro_label})", "OTR Sell Vol (CmltvSellVol)",
+                   "Sell Diff (RO - OTR)", "Sell Match"]]
+    return recon, ro_label, otr_src
 
 
 def classify_segment_vectorized(df):
@@ -699,7 +813,8 @@ tabs = st.tabs([
     "Temporal",           # 12
     "Client × Product",   # 13
     "Txn Analysis",       # 14
-    "Audit Flags",        # 15
+    "OTR Recon",          # 15
+    "Audit Flags",        # 16
 ])
 
 
@@ -2412,10 +2527,118 @@ with tabs[14]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TAB 15: AUDIT FLAGS CONSOLIDATED
+# TAB 15: OTR RECONCILIATION
 # ═══════════════════════════════════════════════════════════════════════════
 
 with tabs[15]:
+    section_header("Section 16: OTR vs RO Volume Reconciliation")
+
+    if uploaded_otr is None or df_otr.empty:
+        st.info(
+            "Upload the OTR / Clearing Obligation CSV (NCL or ICCL) in the "
+            "sidebar to run a date-wise reconciliation of Cumulative Buy Volume "
+            "(column X) and Cumulative Sell Volume against the Cash RO."
+        )
+    else:
+        otr_recon_df, ro_lbl, otr_src_lbl = build_otr_recon(df_otr, df_trades)
+
+        if otr_recon_df.empty:
+            st.warning(
+                "Unable to build the reconciliation — required columns "
+                "(RptgDt / CmltvBuyVol in OTR, or Txn Date / Qty / Buy-Sell in RO) "
+                "could not be located."
+            )
+        else:
+            st.markdown(
+                f"**OTR Source:** `{otr_src_lbl or 'unknown'}` &nbsp;&nbsp; "
+                f"**RO Universe Compared:** `{ro_lbl}` &nbsp;&nbsp; "
+                f"**Trading Days:** `{len(otr_recon_df)}`"
+            )
+
+            ro_buy_col = f"RO Buy Vol ({ro_lbl})"
+            ro_sell_col = f"RO Sell Vol ({ro_lbl})"
+            tot_ro_buy = otr_recon_df[ro_buy_col].sum()
+            tot_ro_sell = otr_recon_df[ro_sell_col].sum()
+            tot_otr_buy = otr_recon_df["OTR Buy Vol (CmltvBuyVol)"].sum()
+            tot_otr_sell = otr_recon_df["OTR Sell Vol (CmltvSellVol)"].sum()
+            buy_diff_total = tot_ro_buy - tot_otr_buy
+            sell_diff_total = tot_ro_sell - tot_otr_sell
+            mism_buy = (otr_recon_df["Buy Match"] == "No").sum()
+            mism_sell = (otr_recon_df["Sell Match"] == "No").sum()
+
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.markdown(metric_card(f"RO Buy Vol ({ro_lbl})", f"{tot_ro_buy:,.0f}"),
+                            unsafe_allow_html=True)
+            with c2:
+                st.markdown(metric_card("OTR Buy Vol", f"{tot_otr_buy:,.0f}"),
+                            unsafe_allow_html=True)
+            with c3:
+                st.markdown(metric_card(f"RO Sell Vol ({ro_lbl})", f"{tot_ro_sell:,.0f}"),
+                            unsafe_allow_html=True)
+            with c4:
+                st.markdown(metric_card("OTR Sell Vol", f"{tot_otr_sell:,.0f}"),
+                            unsafe_allow_html=True)
+
+            d1, d2, d3, d4 = st.columns(4)
+            with d1:
+                st.markdown(metric_card("Buy Vol Diff (RO - OTR)",
+                                        f"{buy_diff_total:,.0f}"),
+                            unsafe_allow_html=True)
+            with d2:
+                st.markdown(metric_card("Sell Vol Diff (RO - OTR)",
+                                        f"{sell_diff_total:,.0f}"),
+                            unsafe_allow_html=True)
+            with d3:
+                st.markdown(metric_card("Buy Mismatch Days", f"{mism_buy}"),
+                            unsafe_allow_html=True)
+            with d4:
+                st.markdown(metric_card("Sell Mismatch Days", f"{mism_sell}"),
+                            unsafe_allow_html=True)
+
+            if mism_buy or mism_sell:
+                flag_card("high",
+                          f"{mism_buy} day(s) with Buy volume mismatch and "
+                          f"{mism_sell} day(s) with Sell volume mismatch — "
+                          "investigate per SA 330 / SA 500 before forming the "
+                          "completeness conclusion.")
+                all_flags.append(
+                    ("high", "OTR Recon",
+                     f"{mism_buy} buy / {mism_sell} sell mismatch day(s) between "
+                     f"OTR and RO"))
+            else:
+                flag_card("low",
+                          "All trading days reconcile between OTR and RO — "
+                          "Buy and Sell volumes agree.")
+
+            st.markdown("#### Date-wise Reconciliation")
+
+            def _hl_match(val):
+                if val == "No":
+                    return "background-color: #fde8e8; color: #c0392b; font-weight: 600;"
+                if val == "Yes":
+                    return "background-color: #e8f5e0; color: #2d6a06;"
+                return ""
+
+            num_cols = [c for c in otr_recon_df.columns if c != "Date"
+                        and c not in ("Buy Match", "Sell Match")]
+            styled = (otr_recon_df.style
+                      .map(_hl_match, subset=["Buy Match", "Sell Match"])
+                      .format({c: "{:,.0f}" for c in num_cols}))
+            st.dataframe(styled, hide_index=True, use_container_width=True)
+
+    with st.expander("Audit Procedures — OTR Recon"):
+        for step_no, procedure, evidence in AUDIT_PROCEDURES.get("OTR Recon", []):
+            st.markdown(f"**Step {step_no}:** {procedure}")
+            st.markdown(f"*Expected Evidence:* {evidence}")
+            st.markdown("---")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 16: AUDIT FLAGS CONSOLIDATED
+# ═══════════════════════════════════════════════════════════════════════════
+
+with tabs[16]:
     section_header("Consolidated Audit Flags")
 
     if all_flags:
@@ -2733,6 +2956,68 @@ def generate_excel_report():
         recon.columns = ["Month", "Segment", "Turnover - As per LD (Rs.)"]
         recon["Month"] = recon["Month"].astype(str)
         write_df(ws4, recon, 4, section="Turnover Recon", show_total_cols=["Turnover - As per LD (Rs.)"])
+
+    # ══════════════════════════════════════════════════════
+    # Sheet 4b: OTR Reconciliation (only when OTR file is uploaded)
+    # ══════════════════════════════════════════════════════
+    if uploaded_otr is not None and not df_otr.empty:
+        ws_otr = wb.create_sheet("OTR Recon")
+        otr_recon_xl, ro_lbl_xl, otr_src_xl = build_otr_recon(df_otr, df_trades)
+        sheet_header(ws_otr,
+                     "OTR (Clearing Corp Obligation) vs RO Volume Reconciliation",
+                     subtitle_text=f"{entity_name} | {audit_period} | "
+                                   f"OTR Source: {otr_src_xl or 'unknown'} | "
+                                   f"RO Universe: {ro_lbl_xl}")
+        if otr_recon_xl.empty:
+            ws_otr.cell(4, 1, "Reconciliation could not be generated — required "
+                              "columns missing from OTR or RO file.").font = note_font
+        else:
+            ro_buy_col_xl = f"RO Buy Vol ({ro_lbl_xl})"
+            ro_sell_col_xl = f"RO Sell Vol ({ro_lbl_xl})"
+            kv_block(ws_otr, 4, [
+                ("OTR Source (Clearing Corp)", otr_src_xl or "unknown"),
+                ("RO Universe Compared", ro_lbl_xl),
+                ("Trading Days Reconciled", int(len(otr_recon_xl))),
+                (f"Total RO Buy Volume ({ro_lbl_xl})",
+                 int(otr_recon_xl[ro_buy_col_xl].sum())),
+                ("Total OTR Buy Volume (CmltvBuyVol)",
+                 int(otr_recon_xl["OTR Buy Vol (CmltvBuyVol)"].sum())),
+                ("Buy Volume Difference (RO - OTR)",
+                 int(otr_recon_xl[ro_buy_col_xl].sum()
+                     - otr_recon_xl["OTR Buy Vol (CmltvBuyVol)"].sum())),
+                (f"Total RO Sell Volume ({ro_lbl_xl})",
+                 int(otr_recon_xl[ro_sell_col_xl].sum())),
+                ("Total OTR Sell Volume (CmltvSellVol)",
+                 int(otr_recon_xl["OTR Sell Vol (CmltvSellVol)"].sum())),
+                ("Sell Volume Difference (RO - OTR)",
+                 int(otr_recon_xl[ro_sell_col_xl].sum()
+                     - otr_recon_xl["OTR Sell Vol (CmltvSellVol)"].sum())),
+                ("Buy Mismatch Days",
+                 int((otr_recon_xl["Buy Match"] == "No").sum())),
+                ("Sell Mismatch Days",
+                 int((otr_recon_xl["Sell Match"] == "No").sum())),
+            ])
+            start_row = 4 + 11 + 2 + 2
+            sec_title(ws_otr, start_row, "Date-wise Buy / Sell Volume Reconciliation")
+            r_after = write_df(
+                ws_otr, otr_recon_xl, start_row + 1,
+                section="OTR Recon",
+                show_total_cols=[ro_buy_col_xl, "OTR Buy Vol (CmltvBuyVol)",
+                                 ro_sell_col_xl, "OTR Sell Vol (CmltvSellVol)"],
+            )
+            # Highlight mismatch rows in red
+            try:
+                hdr_r = start_row + 1
+                buy_match_idx = list(otr_recon_xl.columns).index("Buy Match") + 1
+                sell_match_idx = list(otr_recon_xl.columns).index("Sell Match") + 1
+                for offset in range(len(otr_recon_xl)):
+                    rr = hdr_r + 1 + offset
+                    if ws_otr.cell(rr, buy_match_idx).value == "No":
+                        ws_otr.cell(rr, buy_match_idx).fill = hi_fill
+                    if ws_otr.cell(rr, sell_match_idx).value == "No":
+                        ws_otr.cell(rr, sell_match_idx).fill = hi_fill
+            except (ValueError, IndexError):
+                pass
 
     # ══════════════════════════════════════════════════════
     # Sheet 5: Client Concentration
