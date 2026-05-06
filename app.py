@@ -2493,14 +2493,30 @@ def generate_excel_report():
     BPS_FMT = '0.0000'
     INT_FMT = '#,##0'
 
+    def _safe(v):
+        """openpyxl rejects NaN/Inf/NaT and strings >32767 chars — coerce to safe values."""
+        if v is None:
+            return ""
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        if isinstance(v, str) and len(v) > 32767:
+            return v[:32760] + "..."
+        return v
+
     # ── Reusable writers ──
     def hdr_row(ws, r, vals, col=1):
         for i, v in enumerate(vals):
-            c = ws.cell(r, col + i, v)
+            c = ws.cell(r, col + i, _safe(v))
             c.font, c.fill, c.border, c.alignment = hdr_font, hdr_fill, bdr, ctr
 
     def data_row(ws, r, vals, col=1, bold=False, stripe=False):
         for i, v in enumerate(vals):
+            v = _safe(v)
             c = ws.cell(r, col + i, v)
             c.font = body_b if bold else body
             c.border = bdr
@@ -2517,6 +2533,7 @@ def generate_excel_report():
 
     def total_row(ws, r, vals, col=1):
         for i, v in enumerate(vals):
+            v = _safe(v)
             c = ws.cell(r, col + i, v)
             c.font = total_font
             c.border = thick_bottom
@@ -2592,11 +2609,12 @@ def generate_excel_report():
         hdr_row(ws, start, ["Metric", "Value"])
         for i, (k, v) in enumerate(pairs):
             r = start + 1 + i
-            ws.cell(r, 1, k).font = body_b
+            v = _safe(v)
+            ws.cell(r, 1, _safe(k)).font = body_b
             ws.cell(r, 1).border = bdr
             ws.cell(r, 2, v).font = body
             ws.cell(r, 2).border = bdr
-            if isinstance(v, (int, float)):
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
                 ws.cell(r, 2).alignment = rt
                 ws.cell(r, 2).number_format = INR_FMT if isinstance(v, float) else INT_FMT
         return start + 1 + len(pairs) + 1
@@ -3292,16 +3310,22 @@ def generate_excel_report():
 
 # Generate and offer download
 if st.button("Generate Excel Report", type="primary"):
-    with st.spinner("Generating report..."):
-        excel_buffer = generate_excel_report()
-    filename = f"Brokerage_Analytics_{entity_name.replace(' ', '_')}_{audit_period.replace(' ', '_')}.xlsx"
-    st.download_button(
-        label="Download Excel Report",
-        data=excel_buffer,
-        file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.success("Report generated successfully!")
+    import traceback
+    try:
+        with st.spinner("Generating report..."):
+            excel_buffer = generate_excel_report()
+        filename = f"Brokerage_Analytics_{entity_name.replace(' ', '_')}_{audit_period.replace(' ', '_')}.xlsx"
+        st.download_button(
+            label="Download Excel Report",
+            data=excel_buffer,
+            file_name=filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.success("Report generated successfully!")
+    except Exception as e:
+        st.error(f"Excel export failed: {type(e).__name__}: {e}")
+        with st.expander("Show full traceback"):
+            st.code(traceback.format_exc())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
