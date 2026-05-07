@@ -735,40 +735,61 @@ def build_otr_recon(df_otr, df_trades):
 
 def classify_segment_vectorized(df):
     """Classify trades into NSE Cash, BSE Cash, or F&O using vectorized ops.
-    If _file_segment is 'F&O', all trades in that file are forced to F&O.
-    If _file_segment is 'Cash', classification is by exchange (NSE/BSE)."""
-    segment = pd.Series("NSE Cash", index=df.index)
 
-    # 0. If _file_segment tag exists, use it as the primary classifier
-    if "_file_segment" in df.columns:
-        is_fo_file = df["_file_segment"].astype(str).str.upper() == "F&O"
-        segment = segment.where(~is_fo_file, "F&O")
+    Priority order (highest first):
+      1. Sheet name signals — 'fo'/'f&o'/'futures'/'options' in _source_sheet → F&O;
+         'cash'/'nse and bse ro'/'all ro' in _source_sheet → Cash. This wins over
+         the upload-slot tag so a workbook with mixed Cash+F&O sheets uploaded
+         into either slot is still classified correctly.
+      2. Row-level content signals — Instrument FUT/OPT, Scrip name FUT/OPT,
+         non-empty Expiry → F&O.
+      3. Fallback to _file_segment (the sidebar slot) for rows where neither
+         sheet name nor content gave a signal.
+      4. Default any still-unknown rows to NSE Cash.
+      5. Refine NSE Cash → BSE Cash where Exchange = BSE.
+    """
+    segment = pd.Series([None] * len(df), index=df.index, dtype=object)
 
-    # 1. Source sheet name contains 'fo' -> F&O (fallback for mixed files)
+    # 1. Sheet-name signals (primary — overrides upload slot)
     if "_source_sheet" in df.columns:
-        source_lower = df["_source_sheet"].astype(str).str.lower()
-        fo_source = source_lower.str.contains("fo|f&o", na=False, regex=True)
-        segment = segment.where(~fo_source, "F&O")
+        sl = df["_source_sheet"].astype(str).str.lower()
+        fo_sheet = sl.str.contains(r"fo|f&o|futures|options", na=False, regex=True)
+        cash_sheet = (
+            sl.str.contains(r"cash|nse and bse ro|all ro", na=False, regex=True)
+            & ~fo_sheet
+        )
+        segment = segment.where(~fo_sheet, "F&O")
+        segment = segment.where(~cash_sheet, "NSE Cash")
 
-    # 2. Instrument column contains FUT or OPT -> F&O
+    # 2. Content signals — Instrument FUT/OPT
     if COL_INSTRUMENT in df.columns:
         instr_upper = df[COL_INSTRUMENT].astype(str).str.upper()
         fo_instr = instr_upper.str.contains("FUT|OPT", na=False, regex=True)
         segment = segment.where(~fo_instr, "F&O")
 
-    # 3. Scrip name contains FUT or OPT -> F&O
+    # 3. Scrip name FUT/OPT
     if COL_SCRIP_NAME in df.columns:
         scrip_upper = df[COL_SCRIP_NAME].astype(str).str.upper()
         fo_scrip = scrip_upper.str.contains("FUT|OPT", na=False, regex=True)
         segment = segment.where(~fo_scrip, "F&O")
 
-    # 4. Expiry date is not empty -> F&O
+    # 4. Expiry date not empty → F&O
     if COL_EXPIRY in df.columns:
         expiry_str = df[COL_EXPIRY].astype(str).str.strip()
         has_expiry = ~expiry_str.isin(["", "nan", "None", "NaT", "NaN", "nat"])
         segment = segment.where(~has_expiry, "F&O")
 
-    # 5. Exchange is BSE and not already F&O -> BSE Cash
+    # 5. Fallback to upload-slot tag for rows still unclassified
+    if "_file_segment" in df.columns:
+        unknown = segment.isna()
+        is_fo_file = df["_file_segment"].astype(str).str.upper() == "F&O"
+        segment = segment.where(~(unknown & is_fo_file), "F&O")
+        segment = segment.where(~(unknown & ~is_fo_file), "NSE Cash")
+
+    # 6. Default remaining unknowns to NSE Cash
+    segment = segment.fillna("NSE Cash")
+
+    # 7. BSE refinement
     if COL_EXCHANGE in df.columns:
         is_bse = df[COL_EXCHANGE].astype(str).str.upper() == "BSE"
         is_not_fo = segment != "F&O"
