@@ -10,6 +10,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import io
 import math
+import re
 from collections import Counter
 
 from constants import (
@@ -552,6 +553,93 @@ def prepare_trades(df):
         df[COL_PRODUCT_DESC] = df[COL_PRODUCT_DESC].astype(str).str.strip().str.upper()
 
     return df
+
+
+def extract_otr_heading_date(file_name):
+    """Extract YYYYMMDD date stamp from an OTR filename.
+
+    NSE/BSE clearing obligation files follow the convention
+    'Obligation_<...>_YYYYMMDD_<...>.csv'. Returns a pandas Timestamp
+    (date-only) or None if no valid 8-digit date token is found."""
+    if not file_name:
+        return None
+    stem = str(file_name).rsplit(".", 1)[0]
+    for token in re.findall(r"\d{8}", stem):
+        ts = pd.to_datetime(token, format="%Y%m%d", errors="coerce")
+        if pd.notna(ts):
+            return ts.normalize()
+    return None
+
+
+def build_otr_daily_recon(df_otr, df_trades, heading_date):
+    """Single-day Buy/Sell quantity reconciliation between Cash RO and OTR.
+
+    For the date taken from the OTR filename heading, filter Cash RO
+    Txn Date to that day and sum Qty for Buy ('B') and Sell ('S') sides;
+    compare against the totals of DalyBuyTradgVol / DalySellTradgVol in
+    the OTR file (filtered to the same RptgDt where available).
+
+    Returns: (recon_df, ro_label, otr_src). recon_df has one row per
+    side (Buy, Sell) with RO Qty, OTR Daily Vol, Difference and Match.
+    """
+    if df_otr is None or df_otr.empty or heading_date is None:
+        return pd.DataFrame(), "", ""
+
+    otr_src = ""
+    if "Src" in df_otr.columns and df_otr["Src"].notna().any():
+        otr_src = str(df_otr["Src"].dropna().iloc[0]).strip().upper()
+
+    if otr_src == "NCL":
+        ro_label = "NSE Cash"
+        ro_subset = df_trades[df_trades.get("Segment", "") == "NSE Cash"]
+    elif otr_src == "ICCL":
+        ro_label = "BSE Cash"
+        ro_subset = df_trades[df_trades.get("Segment", "") == "BSE Cash"]
+    else:
+        ro_label = "All Cash"
+        ro_subset = df_trades[df_trades.get("Segment", "").isin(["NSE Cash", "BSE Cash"])]
+
+    if ("DalyBuyTradgVol" not in df_otr.columns
+            or "DalySellTradgVol" not in df_otr.columns):
+        return pd.DataFrame(), ro_label, otr_src
+
+    otr_day = df_otr.copy()
+    if "RptgDt" in otr_day.columns and otr_day["RptgDt"].notna().any():
+        otr_day = otr_day[otr_day["RptgDt"].dt.normalize() == heading_date]
+    otr_buy_qty = float(otr_day["DalyBuyTradgVol"].sum()) if not otr_day.empty else 0.0
+    otr_sell_qty = float(otr_day["DalySellTradgVol"].sum()) if not otr_day.empty else 0.0
+
+    if (COL_TXN_DATE not in ro_subset.columns
+            or COL_QTY not in ro_subset.columns
+            or COL_BUY_SELL not in ro_subset.columns
+            or ro_subset.empty):
+        ro_buy_qty = 0.0
+        ro_sell_qty = 0.0
+    else:
+        ro = ro_subset.copy()
+        ro["_d"] = pd.to_datetime(ro[COL_TXN_DATE], errors="coerce").dt.normalize()
+        ro = ro[ro["_d"] == heading_date]
+        sides = ro[COL_BUY_SELL].astype(str).str.strip().str.upper()
+        ro_buy_qty = float(ro.loc[sides.str.startswith("B"), COL_QTY].sum())
+        ro_sell_qty = float(ro.loc[sides.str.startswith("S"), COL_QTY].sum())
+
+    rows = [
+        {
+            "Side": "Buy (B)",
+            f"RO Qty ({ro_label})": ro_buy_qty,
+            "OTR Daily Vol (DalyBuyTradgVol)": otr_buy_qty,
+            "Difference (RO - OTR)": ro_buy_qty - otr_buy_qty,
+            "Match": "Yes" if abs(ro_buy_qty - otr_buy_qty) < 1 else "No",
+        },
+        {
+            "Side": "Sell (S)",
+            f"RO Qty ({ro_label})": ro_sell_qty,
+            "OTR Daily Vol (DalySellTradgVol)": otr_sell_qty,
+            "Difference (RO - OTR)": ro_sell_qty - otr_sell_qty,
+            "Match": "Yes" if abs(ro_sell_qty - otr_sell_qty) < 1 else "No",
+        },
+    ]
+    return pd.DataFrame(rows), ro_label, otr_src
 
 
 def build_otr_recon(df_otr, df_trades):
@@ -2540,6 +2628,97 @@ with tabs[15]:
             "(column X) and Cumulative Sell Volume against the Cash RO."
         )
     else:
+        # Heading-date (single-day) reconciliation:
+        # filename embeds YYYYMMDD; reconcile DalyBuy/SellTradgVol vs Cash RO
+        # Qty filtered for that date and Buy/Sell side.
+        heading_dt = extract_otr_heading_date(uploaded_otr.name)
+        daily_recon_df, daily_ro_lbl, daily_otr_src = build_otr_daily_recon(
+            df_otr, df_trades, heading_dt
+        )
+
+        st.markdown("#### Heading-Date Reconciliation (DalyBuy/SellTradgVol)")
+        if heading_dt is None:
+            st.warning(
+                f"Could not parse a YYYYMMDD date stamp from the OTR filename "
+                f"`{uploaded_otr.name}` — heading-date reconciliation skipped."
+            )
+        elif daily_recon_df.empty:
+            st.warning(
+                "Unable to build heading-date reconciliation — DalyBuyTradgVol / "
+                "DalySellTradgVol missing in OTR, or Txn Date / Qty / Buy-Sell "
+                "missing in RO."
+            )
+        else:
+            heading_label = heading_dt.strftime("%d %b %Y")
+            st.markdown(
+                f"**OTR Filename Date:** `{uploaded_otr.name}` &nbsp;&nbsp; "
+                f"**Filtered Date:** `{heading_label}` &nbsp;&nbsp; "
+                f"**OTR Source:** `{daily_otr_src or 'unknown'}` &nbsp;&nbsp; "
+                f"**RO Universe:** `{daily_ro_lbl}`"
+            )
+
+            buy_row = daily_recon_df.iloc[0]
+            sell_row = daily_recon_df.iloc[1]
+            ro_buy_col_d = f"RO Qty ({daily_ro_lbl})"
+            ro_sell_col_d = ro_buy_col_d  # same column name for both rows
+
+            h1, h2, h3, h4 = st.columns(4)
+            with h1:
+                st.markdown(metric_card(f"RO Buy Qty ({daily_ro_lbl})",
+                                        f"{buy_row[ro_buy_col_d]:,.0f}"),
+                            unsafe_allow_html=True)
+            with h2:
+                st.markdown(metric_card("OTR DalyBuyTradgVol",
+                                        f"{buy_row['OTR Daily Vol (DalyBuyTradgVol)']:,.0f}"),
+                            unsafe_allow_html=True)
+            with h3:
+                st.markdown(metric_card(f"RO Sell Qty ({daily_ro_lbl})",
+                                        f"{sell_row[ro_sell_col_d]:,.0f}"),
+                            unsafe_allow_html=True)
+            with h4:
+                st.markdown(metric_card("OTR DalySellTradgVol",
+                                        f"{sell_row['OTR Daily Vol (DalySellTradgVol)']:,.0f}"),
+                            unsafe_allow_html=True)
+
+            buy_match = buy_row["Match"] == "Yes"
+            sell_match = sell_row["Match"] == "Yes"
+            if buy_match and sell_match:
+                flag_card("low",
+                          f"Buy and Sell quantities for {heading_label} reconcile "
+                          "between Cash RO and OTR daily volumes.")
+            else:
+                msgs = []
+                if not buy_match:
+                    msgs.append(
+                        f"Buy diff {buy_row['Difference (RO - OTR)']:,.0f}")
+                if not sell_match:
+                    msgs.append(
+                        f"Sell diff {sell_row['Difference (RO - OTR)']:,.0f}")
+                flag_card("high",
+                          f"Heading-date mismatch on {heading_label} — "
+                          + "; ".join(msgs)
+                          + ". Investigate per SA 330 / SA 500.")
+                all_flags.append(
+                    ("high", "OTR Recon",
+                     f"Heading-date ({heading_label}) Buy/Sell qty mismatch "
+                     "vs DalyBuy/SellTradgVol"))
+
+            def _hl_match_d(val):
+                if val == "No":
+                    return "background-color: #fde8e8; color: #c0392b; font-weight: 600;"
+                if val == "Yes":
+                    return "background-color: #e8f5e0; color: #2d6a06;"
+                return ""
+
+            num_cols_d = [c for c in daily_recon_df.columns
+                          if c not in ("Side", "Match")]
+            styled_d = (daily_recon_df.style
+                        .map(_hl_match_d, subset=["Match"])
+                        .format({c: "{:,.0f}" for c in num_cols_d}))
+            st.dataframe(styled_d, hide_index=True, use_container_width=True)
+
+        st.markdown("---")
+
         otr_recon_df, ro_lbl, otr_src_lbl = build_otr_recon(df_otr, df_trades)
 
         if otr_recon_df.empty:
