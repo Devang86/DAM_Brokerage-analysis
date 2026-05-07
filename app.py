@@ -579,11 +579,15 @@ def build_otr_daily_recon(df_otr, df_trades, heading_date):
     compare against the totals of DalyBuyTradgVol / DalySellTradgVol in
     the OTR file (filtered to the same RptgDt where available).
 
-    Returns: (recon_df, ro_label, otr_src). recon_df has one row per
-    side (Buy, Sell) with RO Qty, OTR Daily Vol, Difference and Match.
+    Returns: (recon_df, ro_label, otr_src, diag) where diag is a dict
+    with keys: ro_segment_rows, ro_segment_dates_min, ro_segment_dates_max,
+    ro_date_match_rows, missing_cols.
     """
+    diag = {"ro_segment_rows": 0, "ro_segment_dates_min": None,
+            "ro_segment_dates_max": None, "ro_date_match_rows": 0,
+            "missing_cols": []}
     if df_otr is None or df_otr.empty or heading_date is None:
-        return pd.DataFrame(), "", ""
+        return pd.DataFrame(), "", "", diag
 
     otr_src = ""
     if "Src" in df_otr.columns and df_otr["Src"].notna().any():
@@ -599,15 +603,22 @@ def build_otr_daily_recon(df_otr, df_trades, heading_date):
         ro_label = "All Cash"
         ro_subset = df_trades[df_trades.get("Segment", "").isin(["NSE Cash", "BSE Cash"])]
 
+    diag["ro_segment_rows"] = int(len(ro_subset))
+
     if ("DalyBuyTradgVol" not in df_otr.columns
             or "DalySellTradgVol" not in df_otr.columns):
-        return pd.DataFrame(), ro_label, otr_src
+        diag["missing_cols"].append("OTR DalyBuyTradgVol / DalySellTradgVol")
+        return pd.DataFrame(), ro_label, otr_src, diag
 
     otr_day = df_otr.copy()
     if "RptgDt" in otr_day.columns and otr_day["RptgDt"].notna().any():
         otr_day = otr_day[otr_day["RptgDt"].dt.normalize() == heading_date]
     otr_buy_qty = float(otr_day["DalyBuyTradgVol"].sum()) if not otr_day.empty else 0.0
     otr_sell_qty = float(otr_day["DalySellTradgVol"].sum()) if not otr_day.empty else 0.0
+
+    for c in (COL_TXN_DATE, COL_QTY, COL_BUY_SELL):
+        if c not in ro_subset.columns:
+            diag["missing_cols"].append(f"RO {c}")
 
     if (COL_TXN_DATE not in ro_subset.columns
             or COL_QTY not in ro_subset.columns
@@ -618,7 +629,12 @@ def build_otr_daily_recon(df_otr, df_trades, heading_date):
     else:
         ro = ro_subset.copy()
         ro["_d"] = pd.to_datetime(ro[COL_TXN_DATE], errors="coerce").dt.normalize()
+        valid_dates = ro["_d"].dropna()
+        if not valid_dates.empty:
+            diag["ro_segment_dates_min"] = valid_dates.min()
+            diag["ro_segment_dates_max"] = valid_dates.max()
         ro = ro[ro["_d"] == heading_date]
+        diag["ro_date_match_rows"] = int(len(ro))
         sides = ro[COL_BUY_SELL].astype(str).str.strip().str.upper()
         ro_buy_qty = float(ro.loc[sides.str.startswith("B"), COL_QTY].sum())
         ro_sell_qty = float(ro.loc[sides.str.startswith("S"), COL_QTY].sum())
@@ -639,7 +655,7 @@ def build_otr_daily_recon(df_otr, df_trades, heading_date):
             "Match": "Yes" if abs(ro_sell_qty - otr_sell_qty) < 1 else "No",
         },
     ]
-    return pd.DataFrame(rows), ro_label, otr_src
+    return pd.DataFrame(rows), ro_label, otr_src, diag
 
 
 def build_otr_recon(df_otr, df_trades):
@@ -2632,7 +2648,7 @@ with tabs[15]:
         # filename embeds YYYYMMDD; reconcile DalyBuy/SellTradgVol vs Cash RO
         # Qty filtered for that date and Buy/Sell side.
         heading_dt = extract_otr_heading_date(uploaded_otr.name)
-        daily_recon_df, daily_ro_lbl, daily_otr_src = build_otr_daily_recon(
+        daily_recon_df, daily_ro_lbl, daily_otr_src, daily_diag = build_otr_daily_recon(
             df_otr, df_trades, heading_dt
         )
 
@@ -2643,10 +2659,9 @@ with tabs[15]:
                 f"`{uploaded_otr.name}` — heading-date reconciliation skipped."
             )
         elif daily_recon_df.empty:
+            miss = ", ".join(daily_diag.get("missing_cols", [])) or "unknown"
             st.warning(
-                "Unable to build heading-date reconciliation — DalyBuyTradgVol / "
-                "DalySellTradgVol missing in OTR, or Txn Date / Qty / Buy-Sell "
-                "missing in RO."
+                f"Unable to build heading-date reconciliation — missing column(s): {miss}."
             )
         else:
             heading_label = heading_dt.strftime("%d %b %Y")
@@ -2679,6 +2694,41 @@ with tabs[15]:
                 st.markdown(metric_card("OTR DalySellTradgVol",
                                         f"{sell_row['OTR Daily Vol (DalySellTradgVol)']:,.0f}"),
                             unsafe_allow_html=True)
+
+            ro_total_zero = (
+                buy_row[ro_buy_col_d] == 0 and sell_row[ro_sell_col_d] == 0
+            )
+            if ro_total_zero:
+                seg_rows = daily_diag.get("ro_segment_rows", 0)
+                date_rows = daily_diag.get("ro_date_match_rows", 0)
+                d_min = daily_diag.get("ro_segment_dates_min")
+                d_max = daily_diag.get("ro_segment_dates_max")
+                date_range = (
+                    f"{d_min.strftime('%d %b %Y')} to {d_max.strftime('%d %b %Y')}"
+                    if d_min is not None and d_max is not None else "no parseable dates"
+                )
+                if seg_rows == 0:
+                    cause = (
+                        f"`df_trades` has **0 rows** classified as `{daily_ro_lbl}`. "
+                        "Most likely cause: the workbook was uploaded into the **F&O RO** "
+                        "slot (which forces every row to segment F&O) instead of the "
+                        "**Cash RO** slot. Re-upload via the *1. Cash RO File* slot in the sidebar."
+                    )
+                elif date_rows == 0:
+                    cause = (
+                        f"`df_trades` has **{seg_rows:,} rows** in `{daily_ro_lbl}` "
+                        f"(date range {date_range}), but **none** on "
+                        f"{heading_label}. The OTR file is for a date that is not "
+                        "covered by the uploaded Cash RO workbook — upload the RO "
+                        "workbook that includes this trading day."
+                    )
+                else:
+                    cause = (
+                        f"{date_rows} rows match {heading_label} in `{daily_ro_lbl}` "
+                        "but Buy/Sell side did not start with 'B' or 'S' — check the "
+                        f"`{COL_BUY_SELL}` column values."
+                    )
+                flag_card("high", "RO side returned 0 — " + cause)
 
             buy_match = buy_row["Match"] == "Yes"
             sell_match = sell_row["Match"] == "Yes"
